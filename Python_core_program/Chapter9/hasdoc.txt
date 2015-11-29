@@ -1,0 +1,2524 @@
+File name: F:\Applications\Python34\Lib\asyncio\base_events.py
+__doc__ is: 
+"""Base implementation of event loop.
+
+The event loop can be broken up into a multiplexer (the part
+responsible for notifying us of IO events) and the event loop proper,
+which wraps a multiplexer with functionality for scheduling callbacks,
+immediately or at a given time in the future.
+
+Whenever a public API takes a callback, subsequent positional
+arguments will be passed to the callback if/when it is called.  This
+avoids the proliferation of trivial lambdas implementing closures.
+Keyword arguments for the callback are not supported; this is a
+conscious design decision, leaving the door open for keyword arguments
+to modify the meaning of the API call itself.
+"""
+
+File name: F:\Applications\Python34\Lib\asyncio\constants.py
+__doc__ is: 
+"""Constants."""
+
+# After the connection is lost, log warnings after this many write()s.
+LOG_THRESHOLD_FOR_CONNLOST_WRITES = 5
+
+# Seconds to wait before retrying accept().
+ACCEPT_RETRY_DELAY = 1
+
+File name: F:\Applications\Python34\Lib\asyncio\events.py
+__doc__ is: 
+"""Event loop and event loop policy."""
+
+File name: F:\Applications\Python34\Lib\asyncio\futures.py
+__doc__ is: 
+"""A Future class similar to the one in PEP 3148."""
+
+__all__ = ['CancelledError', 'TimeoutError',
+           'InvalidStateError',
+           'Future', 'wrap_future',
+           ]
+
+import concurrent.futures._base
+import logging
+import sys
+import traceback
+
+from . import events
+
+# States for Future.
+_PENDING = 'PENDING'
+_CANCELLED = 'CANCELLED'
+_FINISHED = 'FINISHED'
+
+_PY34 = sys.version_info >= (3, 4)
+
+# TODO: Do we really want to depend on concurrent.futures internals?
+Error = concurrent.futures._base.Error
+CancelledError = concurrent.futures.CancelledError
+TimeoutError = concurrent.futures.TimeoutError
+
+STACK_DEBUG = logging.DEBUG - 1  # heavy-duty debugging
+
+
+class InvalidStateError(Error):
+    """The operation is not allowed in this state."""
+    # TODO: Show the future, its state, the method, and the required state.
+
+
+class _TracebackLogger:
+    """Helper to log a traceback upon destruction if not cleared.
+
+    This solves a nasty problem with Futures and Tasks that have an
+    exception set: if nobody asks for the exception, the exception is
+    never logged.  This violates the Zen of Python: 'Errors should
+    never pass silently.  Unless explicitly silenced.'
+
+    However, we don't want to log the exception as soon as
+    set_exception() is called: if the calling code is written
+    properly, it will get the exception and handle it properly.  But
+    we *do* want to log it if result() or exception() was never called
+    -- otherwise developers waste a lot of time wondering why their
+    buggy code fails silently.
+
+    An earlier attempt added a __del__() method to the Future class
+    itself, but this backfired because the presence of __del__()
+    prevents garbage collection from breaking cycles.  A way out of
+    this catch-22 is to avoid having a __del__() method on the Future
+    class itself, but instead to have a reference to a helper object
+    with a __del__() method that logs the traceback, where we ensure
+    that the helper object doesn't participate in cycles, and only the
+    Future has a reference to it.
+
+    The helper object is added when set_exception() is called.  When
+    the Future is collected, and the helper is present, the helper
+    object is also collected, and its __del__() method will log the
+    traceback.  When the Future's result() or exception() method is
+    called (and a helper object is present), it removes the the helper
+    object, after calling its clear() method to prevent it from
+    logging.
+
+    One downside is that we do a fair amount of work to extract the
+    traceback from the exception, even when it is never logged.  It
+    would seem cheaper to just store the exception object, but that
+    references the traceback, which references stack frames, which may
+    reference the Future, which references the _TracebackLogger, and
+    then the _TracebackLogger would be included in a cycle, which is
+    what we're trying to avoid!  As an optimization, we don't
+    immediately format the exception; we only do the work when
+    activate() is called, which call is delayed until after all the
+    Future's callbacks have run.  Since usually a Future has at least
+    one callback (typically set by 'yield from') and usually that
+    callback extracts the callback, thereby removing the need to
+    format the exception.
+
+    PS. I don't claim credit for this solution.  I first heard of it
+    in a discussion about closing files when they are collected.
+    """
+
+    __slots__ = ['exc', 'tb', 'loop']
+
+    def __init__(self, exc, loop):
+        self.loop = loop
+        self.exc = exc
+        self.tb = None
+
+    def activate(self):
+        exc = self.exc
+        if exc is not None:
+            self.exc = None
+            self.tb = traceback.format_exception(exc.__class__, exc,
+                                                 exc.__traceback__)
+
+    def clear(self):
+        self.exc = None
+        self.tb = None
+
+    def __del__(self):
+        if self.tb:
+            msg = 'Future/Task exception was never retrieved:\n{tb}'
+            context = {
+                'message': msg.format(tb=''.join(self.tb)),
+            }
+            self.loop.call_exception_handler(context)
+
+
+class Future:
+    """This class is *almost* compatible with concurrent.futures.Future.
+
+    Differences:
+
+    - result() and exception() do not take a timeout argument and
+      raise an exception when the future isn't done yet.
+
+    - Callbacks registered with add_done_callback() are always called
+      via the event loop's call_soon_threadsafe().
+
+    - This class is not compatible with the wait() and as_completed()
+      methods in the concurrent.futures package.
+
+    (In Python 3.4 or later we may be able to unify the implementations.)
+    """
+
+    # Class variables serving as defaults for instance variables.
+    _state = _PENDING
+    _result = None
+    _exception = None
+    _loop = None
+
+    _blocking = False  # proper use of future (yield vs yield from)
+
+    _log_traceback = False   # Used for Python 3.4 and later
+    _tb_logger = None        # Used for Python 3.3 only
+
+    def __init__(self, *, loop=None):
+        """Initialize the future.
+
+        The optional event_loop argument allows to explicitly set the event
+        loop object used by the future. If it's not provided, the future uses
+        the default event loop.
+        """
+        if loop is None:
+            self._loop = events.get_event_loop()
+        else:
+            self._loop = loop
+        self._callbacks = []
+
+    def __repr__(self):
+        res = self.__class__.__name__
+        if self._state == _FINISHED:
+            if self._exception is not None:
+                res += '<exception={!r}>'.format(self._exception)
+            else:
+                res += '<result={!r}>'.format(self._result)
+        elif self._callbacks:
+            size = len(self._callbacks)
+            if size > 2:
+                res += '<{}, [{}, <{} more>, {}]>'.format(
+                    self._state, self._callbacks[0],
+                    size-2, self._callbacks[-1])
+            else:
+                res += '<{}, {}>'.format(self._state, self._callbacks)
+        else:
+            res += '<{}>'.format(self._state)
+        return res
+
+    if _PY34:
+        def __del__(self):
+            if not self._log_traceback:
+                # set_exception() was not called, or result() or exception()
+                # has consumed the exception
+                return
+            exc = self._exception
+            context = {
+                'message': 'Future/Task exception was never retrieved',
+                'exception': exc,
+                'future': self,
+            }
+            self._loop.call_exception_handler(context)
+
+    def cancel(self):
+        """Cancel the future and schedule callbacks.
+
+        If the future is already done or cancelled, return False.  Otherwise,
+        change the future's state to cancelled, schedule the callbacks and
+        return True.
+        """
+        if self._state != _PENDING:
+            return False
+        self._state = _CANCELLED
+        self._schedule_callbacks()
+        return True
+
+    def _schedule_callbacks(self):
+        """Internal: Ask the event loop to call all callbacks.
+
+        The callbacks are scheduled to be called as soon as possible. Also
+        clears the callback list.
+        """
+        callbacks = self._callbacks[:]
+        if not callbacks:
+            return
+
+        self._callbacks[:] = []
+        for callback in callbacks:
+            self._loop.call_soon(callback, self)
+
+    def cancelled(self):
+        """Return True if the future was cancelled."""
+        return self._state == _CANCELLED
+
+    # Don't implement running(); see http://bugs.python.org/issue18699
+
+    def done(self):
+        """Return True if the future is done.
+
+        Done means either that a result / exception are available, or that the
+        future was cancelled.
+        """
+        return self._state != _PENDING
+
+    def result(self):
+        """Return the result this future represents.
+
+        If the future has been cancelled, raises CancelledError.  If the
+        future's result isn't yet available, raises InvalidStateError.  If
+        the future is done and has an exception set, this exception is raised.
+        """
+        if self._state == _CANCELLED:
+            raise CancelledError
+        if self._state != _FINISHED:
+            raise InvalidStateError('Result is not ready.')
+        self._log_traceback = False
+        if self._tb_logger is not None:
+            self._tb_logger.clear()
+            self._tb_logger = None
+        if self._exception is not None:
+            raise self._exception
+        return self._result
+
+    def exception(self):
+        """Return the exception that was set on this future.
+
+        The exception (or None if no exception was set) is returned only if
+        the future is done.  If the future has been cancelled, raises
+        CancelledError.  If the future isn't done yet, raises
+        InvalidStateError.
+        """
+        if self._state == _CANCELLED:
+            raise CancelledError
+        if self._state != _FINISHED:
+            raise InvalidStateError('Exception is not set.')
+        self._log_traceback = False
+        if self._tb_logger is not None:
+            self._tb_logger.clear()
+            self._tb_logger = None
+        return self._exception
+
+    def add_done_callback(self, fn):
+        """Add a callback to be run when the future becomes done.
+
+        The callback is called with a single argument - the future object. If
+        the future is already done when this is called, the callback is
+        scheduled with call_soon.
+        """
+        if self._state != _PENDING:
+            self._loop.call_soon(fn, self)
+        else:
+            self._callbacks.append(fn)
+
+    # New method not in PEP 3148.
+
+    def remove_done_callback(self, fn):
+        """Remove all instances of a callback from the "call when done" list.
+
+        Returns the number of callbacks removed.
+        """
+        filtered_callbacks = [f for f in self._callbacks if f != fn]
+        removed_count = len(self._callbacks) - len(filtered_callbacks)
+        if removed_count:
+            self._callbacks[:] = filtered_callbacks
+        return removed_count
+
+    # So-called internal methods (note: no set_running_or_notify_cancel()).
+
+    def set_result(self, result):
+        """Mark the future done and set its result.
+
+        If the future is already done when this method is called, raises
+        InvalidStateError.
+        """
+        if self._state != _PENDING:
+            raise InvalidStateError('{}: {!r}'.format(self._state, self))
+        self._result = result
+        self._state = _FINISHED
+        self._schedule_callbacks()
+
+    def set_exception(self, exception):
+        """Mark the future done and set an exception.
+
+        If the future is already done when this method is called, raises
+        InvalidStateError.
+        """
+        if self._state != _PENDING:
+            raise InvalidStateError('{}: {!r}'.format(self._state, self))
+        if isinstance(exception, type):
+            exception = exception()
+        self._exception = exception
+        self._state = _FINISHED
+        self._schedule_callbacks()
+        if _PY34:
+            self._log_traceback = True
+        else:
+            self._tb_logger = _TracebackLogger(exception, self._loop)
+            # Arrange for the logger to be activated after all callbacks
+            # have had a chance to call result() or exception().
+            self._loop.call_soon(self._tb_logger.activate)
+
+    # Truly internal methods.
+
+    def _copy_state(self, other):
+        """Internal helper to copy state from another Future.
+
+        The other Future may be a concurrent.futures.Future.
+        """
+        assert other.done()
+        if self.cancelled():
+            return
+        assert not self.done()
+        if other.cancelled():
+            self.cancel()
+        else:
+            exception = other.exception()
+            if exception is not None:
+                self.set_exception(exception)
+            else:
+                result = other.result()
+                self.set_result(result)
+
+    def __iter__(self):
+        if not self.done():
+            self._blocking = True
+            yield self  # This tells Task to wait for completion.
+        assert self.done(), "yield from wasn't used with future"
+        return self.result()  # May raise too.
+
+
+def wrap_future(fut, *, loop=None):
+    """Wrap concurrent.futures.Future object."""
+    if isinstance(fut, Future):
+        return fut
+    assert isinstance(fut, concurrent.futures.Future), \
+        'concurrent.futures.Future is expected, got {!r}'.format(fut)
+    if loop is None:
+        loop = events.get_event_loop()
+    new_future = Future(loop=loop)
+
+    def _check_cancel_other(f):
+        if f.cancelled():
+            fut.cancel()
+
+    new_future.add_done_callback(_check_cancel_other)
+    fut.add_done_callback(
+        lambda future: loop.call_soon_threadsafe(
+            new_future._copy_state, fut))
+    return new_future
+
+File name: F:\Applications\Python34\Lib\asyncio\locks.py
+__doc__ is: 
+"""Synchronization primitives."""
+
+File name: F:\Applications\Python34\Lib\asyncio\log.py
+__doc__ is: 
+"""Logging configuration."""
+
+import logging
+
+
+# Name the logger after the package.
+logger = logging.getLogger(__package__)
+
+File name: F:\Applications\Python34\Lib\asyncio\proactor_events.py
+__doc__ is: 
+"""Event loop using a proactor and related classes.
+
+File name: F:\Applications\Python34\Lib\asyncio\protocols.py
+__doc__ is: 
+"""Abstract Protocol class."""
+
+__all__ = ['BaseProtocol', 'Protocol', 'DatagramProtocol',
+           'SubprocessProtocol']
+
+
+class BaseProtocol:
+    """Common base class for protocol interfaces.
+
+    Usually user implements protocols that derived from BaseProtocol
+    like Protocol or ProcessProtocol.
+
+    The only case when BaseProtocol should be implemented directly is
+    write-only transport like write pipe
+    """
+
+    def connection_made(self, transport):
+        """Called when a connection is made.
+
+        The argument is the transport representing the pipe connection.
+        To receive data, wait for data_received() calls.
+        When the connection is closed, connection_lost() is called.
+        """
+
+    def connection_lost(self, exc):
+        """Called when the connection is lost or closed.
+
+        The argument is an exception object or None (the latter
+        meaning a regular EOF is received or the connection was
+        aborted or closed).
+        """
+
+    def pause_writing(self):
+        """Called when the transport's buffer goes over the high-water mark.
+
+        Pause and resume calls are paired -- pause_writing() is called
+        once when the buffer goes strictly over the high-water mark
+        (even if subsequent writes increases the buffer size even
+        more), and eventually resume_writing() is called once when the
+        buffer size reaches the low-water mark.
+
+        Note that if the buffer size equals the high-water mark,
+        pause_writing() is not called -- it must go strictly over.
+        Conversely, resume_writing() is called when the buffer size is
+        equal or lower than the low-water mark.  These end conditions
+        are important to ensure that things go as expected when either
+        mark is zero.
+
+        NOTE: This is the only Protocol callback that is not called
+        through EventLoop.call_soon() -- if it were, it would have no
+        effect when it's most needed (when the app keeps writing
+        without yielding until pause_writing() is called).
+        """
+
+    def resume_writing(self):
+        """Called when the transport's buffer drains below the low-water mark.
+
+        See pause_writing() for details.
+        """
+
+
+class Protocol(BaseProtocol):
+    """Interface for stream protocol.
+
+    The user should implement this interface.  They can inherit from
+    this class but don't need to.  The implementations here do
+    nothing (they don't raise exceptions).
+
+    When the user wants to requests a transport, they pass a protocol
+    factory to a utility function (e.g., EventLoop.create_connection()).
+
+    When the connection is made successfully, connection_made() is
+    called with a suitable transport object.  Then data_received()
+    will be called 0 or more times with data (bytes) received from the
+    transport; finally, connection_lost() will be called exactly once
+    with either an exception object or None as an argument.
+
+    State machine of calls:
+
+      start -> CM [-> DR*] [-> ER?] -> CL -> end
+    """
+
+    def data_received(self, data):
+        """Called when some data is received.
+
+        The argument is a bytes object.
+        """
+
+    def eof_received(self):
+        """Called when the other end calls write_eof() or equivalent.
+
+        If this returns a false value (including None), the transport
+        will close itself.  If it returns a true value, closing the
+        transport is up to the protocol.
+        """
+
+
+class DatagramProtocol(BaseProtocol):
+    """Interface for datagram protocol."""
+
+    def datagram_received(self, data, addr):
+        """Called when some datagram is received."""
+
+    def error_received(self, exc):
+        """Called when a send or receive operation raises an OSError.
+
+        (Other than BlockingIOError or InterruptedError.)
+        """
+
+
+class SubprocessProtocol(BaseProtocol):
+    """Interface for protocol for subprocess calls."""
+
+    def pipe_data_received(self, fd, data):
+        """Called when the subprocess writes data into stdout/stderr pipe.
+
+        fd is int file descriptor.
+        data is bytes object.
+        """
+
+    def pipe_connection_lost(self, fd, exc):
+        """Called when a file descriptor associated with the child process is
+        closed.
+
+        fd is the int file descriptor that was closed.
+        """
+
+    def process_exited(self):
+        """Called when subprocess has exited."""
+
+File name: F:\Applications\Python34\Lib\asyncio\queues.py
+__doc__ is: 
+"""Queues"""
+
+File name: F:\Applications\Python34\Lib\asyncio\selector_events.py
+__doc__ is: 
+"""Event loop using a selector and related classes.
+
+A selector is a "notify-when-ready" multiplexer.  For a subclass which
+also includes support for signal handling, see the unix_events sub-module.
+"""
+
+File name: F:\Applications\Python34\Lib\asyncio\streams.py
+__doc__ is: 
+"""Stream-related things."""
+
+__all__ = ['StreamReader', 'StreamWriter', 'StreamReaderProtocol',
+           'open_connection', 'start_server',
+           'IncompleteReadError',
+           ]
+
+import socket
+
+if hasattr(socket, 'AF_UNIX'):
+    __all__.extend(['open_unix_connection', 'start_unix_server'])
+
+from . import events
+from . import futures
+from . import protocols
+from . import tasks
+
+
+_DEFAULT_LIMIT = 2**16
+
+
+class IncompleteReadError(EOFError):
+    """
+    Incomplete read error. Attributes:
+
+    - partial: read bytes string before the end of stream was reached
+    - expected: total number of expected bytes
+    """
+    def __init__(self, partial, expected):
+        EOFError.__init__(self, "%s bytes read on a total of %s expected bytes"
+                                % (len(partial), expected))
+        self.partial = partial
+        self.expected = expected
+
+
+@tasks.coroutine
+def open_connection(host=None, port=None, *,
+                    loop=None, limit=_DEFAULT_LIMIT, **kwds):
+    """A wrapper for create_connection() returning a (reader, writer) pair.
+
+    The reader returned is a StreamReader instance; the writer is a
+    StreamWriter instance.
+
+    The arguments are all the usual arguments to create_connection()
+    except protocol_factory; most common are positional host and port,
+    with various optional keyword arguments following.
+
+    Additional optional keyword arguments are loop (to set the event loop
+    instance to use) and limit (to set the buffer limit passed to the
+    StreamReader).
+
+    (If you want to customize the StreamReader and/or
+    StreamReaderProtocol classes, just copy the code -- there's
+    really nothing special here except some convenience.)
+    """
+    if loop is None:
+        loop = events.get_event_loop()
+    reader = StreamReader(limit=limit, loop=loop)
+    protocol = StreamReaderProtocol(reader, loop=loop)
+    transport, _ = yield from loop.create_connection(
+        lambda: protocol, host, port, **kwds)
+    writer = StreamWriter(transport, protocol, reader, loop)
+    return reader, writer
+
+
+@tasks.coroutine
+def start_server(client_connected_cb, host=None, port=None, *,
+                 loop=None, limit=_DEFAULT_LIMIT, **kwds):
+    """Start a socket server, call back for each client connected.
+
+    The first parameter, `client_connected_cb`, takes two parameters:
+    client_reader, client_writer.  client_reader is a StreamReader
+    object, while client_writer is a StreamWriter object.  This
+    parameter can either be a plain callback function or a coroutine;
+    if it is a coroutine, it will be automatically converted into a
+    Task.
+
+    The rest of the arguments are all the usual arguments to
+    loop.create_server() except protocol_factory; most common are
+    positional host and port, with various optional keyword arguments
+    following.  The return value is the same as loop.create_server().
+
+    Additional optional keyword arguments are loop (to set the event loop
+    instance to use) and limit (to set the buffer limit passed to the
+    StreamReader).
+
+    The return value is the same as loop.create_server(), i.e. a
+    Server object which can be used to stop the service.
+    """
+    if loop is None:
+        loop = events.get_event_loop()
+
+    def factory():
+        reader = StreamReader(limit=limit, loop=loop)
+        protocol = StreamReaderProtocol(reader, client_connected_cb,
+                                        loop=loop)
+        return protocol
+
+    return (yield from loop.create_server(factory, host, port, **kwds))
+
+
+if hasattr(socket, 'AF_UNIX'):
+    # UNIX Domain Sockets are supported on this platform
+
+    @tasks.coroutine
+    def open_unix_connection(path=None, *,
+                             loop=None, limit=_DEFAULT_LIMIT, **kwds):
+        """Similar to `open_connection` but works with UNIX Domain Sockets."""
+        if loop is None:
+            loop = events.get_event_loop()
+        reader = StreamReader(limit=limit, loop=loop)
+        protocol = StreamReaderProtocol(reader, loop=loop)
+        transport, _ = yield from loop.create_unix_connection(
+            lambda: protocol, path, **kwds)
+        writer = StreamWriter(transport, protocol, reader, loop)
+        return reader, writer
+
+
+    @tasks.coroutine
+    def start_unix_server(client_connected_cb, path=None, *,
+                          loop=None, limit=_DEFAULT_LIMIT, **kwds):
+        """Similar to `start_server` but works with UNIX Domain Sockets."""
+        if loop is None:
+            loop = events.get_event_loop()
+
+        def factory():
+            reader = StreamReader(limit=limit, loop=loop)
+            protocol = StreamReaderProtocol(reader, client_connected_cb,
+                                            loop=loop)
+            return protocol
+
+        return (yield from loop.create_unix_server(factory, path, **kwds))
+
+
+class FlowControlMixin(protocols.Protocol):
+    """Reusable flow control logic for StreamWriter.drain().
+
+    This implements the protocol methods pause_writing(),
+    resume_reading() and connection_lost().  If the subclass overrides
+    these it must call the super methods.
+
+    StreamWriter.drain() must check for error conditions and then call
+    _make_drain_waiter(), which will return either () or a Future
+    depending on the paused state.
+    """
+
+    def __init__(self, loop=None):
+        self._loop = loop  # May be None; we may never need it.
+        self._paused = False
+        self._drain_waiter = None
+
+    def pause_writing(self):
+        assert not self._paused
+        self._paused = True
+
+    def resume_writing(self):
+        assert self._paused
+        self._paused = False
+        waiter = self._drain_waiter
+        if waiter is not None:
+            self._drain_waiter = None
+            if not waiter.done():
+                waiter.set_result(None)
+
+    def connection_lost(self, exc):
+        # Wake up the writer if currently paused.
+        if not self._paused:
+            return
+        waiter = self._drain_waiter
+        if waiter is None:
+            return
+        self._drain_waiter = None
+        if waiter.done():
+            return
+        if exc is None:
+            waiter.set_result(None)
+        else:
+            waiter.set_exception(exc)
+
+    def _make_drain_waiter(self):
+        if not self._paused:
+            return ()
+        waiter = self._drain_waiter
+        assert waiter is None or waiter.cancelled()
+        waiter = futures.Future(loop=self._loop)
+        self._drain_waiter = waiter
+        return waiter
+
+
+class StreamReaderProtocol(FlowControlMixin, protocols.Protocol):
+    """Helper class to adapt between Protocol and StreamReader.
+
+    (This is a helper class instead of making StreamReader itself a
+    Protocol subclass, because the StreamReader has other potential
+    uses, and to prevent the user of the StreamReader to accidentally
+    call inappropriate methods of the protocol.)
+    """
+
+    def __init__(self, stream_reader, client_connected_cb=None, loop=None):
+        super().__init__(loop=loop)
+        self._stream_reader = stream_reader
+        self._stream_writer = None
+        self._client_connected_cb = client_connected_cb
+
+    def connection_made(self, transport):
+        self._stream_reader.set_transport(transport)
+        if self._client_connected_cb is not None:
+            self._stream_writer = StreamWriter(transport, self,
+                                               self._stream_reader,
+                                               self._loop)
+            res = self._client_connected_cb(self._stream_reader,
+                                            self._stream_writer)
+            if tasks.iscoroutine(res):
+                tasks.Task(res, loop=self._loop)
+
+    def connection_lost(self, exc):
+        if exc is None:
+            self._stream_reader.feed_eof()
+        else:
+            self._stream_reader.set_exception(exc)
+        super().connection_lost(exc)
+
+    def data_received(self, data):
+        self._stream_reader.feed_data(data)
+
+    def eof_received(self):
+        self._stream_reader.feed_eof()
+
+
+class StreamWriter:
+    """Wraps a Transport.
+
+    This exposes write(), writelines(), [can_]write_eof(),
+    get_extra_info() and close().  It adds drain() which returns an
+    optional Future on which you can wait for flow control.  It also
+    adds a transport property which references the Transport
+    directly.
+    """
+
+    def __init__(self, transport, protocol, reader, loop):
+        self._transport = transport
+        self._protocol = protocol
+        self._reader = reader
+        self._loop = loop
+
+    @property
+    def transport(self):
+        return self._transport
+
+    def write(self, data):
+        self._transport.write(data)
+
+    def writelines(self, data):
+        self._transport.writelines(data)
+
+    def write_eof(self):
+        return self._transport.write_eof()
+
+    def can_write_eof(self):
+        return self._transport.can_write_eof()
+
+    def close(self):
+        return self._transport.close()
+
+    def get_extra_info(self, name, default=None):
+        return self._transport.get_extra_info(name, default)
+
+    def drain(self):
+        """This method has an unusual return value.
+
+        The intended use is to write
+
+          w.write(data)
+          yield from w.drain()
+
+        When there's nothing to wait for, drain() returns (), and the
+        yield-from continues immediately.  When the transport buffer
+        is full (the protocol is paused), drain() creates and returns
+        a Future and the yield-from will block until that Future is
+        completed, which will happen when the buffer is (partially)
+        drained and the protocol is resumed.
+        """
+        if self._reader is not None and self._reader._exception is not None:
+            raise self._reader._exception
+        if self._transport._conn_lost:  # Uses private variable.
+            raise ConnectionResetError('Connection lost')
+        return self._protocol._make_drain_waiter()
+
+
+class StreamReader:
+
+    def __init__(self, limit=_DEFAULT_LIMIT, loop=None):
+        # The line length limit is  a security feature;
+        # it also doubles as half the buffer limit.
+        self._limit = limit
+        if loop is None:
+            loop = events.get_event_loop()
+        self._loop = loop
+        self._buffer = bytearray()
+        self._eof = False  # Whether we're done.
+        self._waiter = None  # A future.
+        self._exception = None
+        self._transport = None
+        self._paused = False
+
+    def exception(self):
+        return self._exception
+
+    def set_exception(self, exc):
+        self._exception = exc
+
+        waiter = self._waiter
+        if waiter is not None:
+            self._waiter = None
+            if not waiter.cancelled():
+                waiter.set_exception(exc)
+
+    def set_transport(self, transport):
+        assert self._transport is None, 'Transport already set'
+        self._transport = transport
+
+    def _maybe_resume_transport(self):
+        if self._paused and len(self._buffer) <= self._limit:
+            self._paused = False
+            self._transport.resume_reading()
+
+    def feed_eof(self):
+        self._eof = True
+        waiter = self._waiter
+        if waiter is not None:
+            self._waiter = None
+            if not waiter.cancelled():
+                waiter.set_result(True)
+
+    def at_eof(self):
+        """Return True if the buffer is empty and 'feed_eof' was called."""
+        return self._eof and not self._buffer
+
+    def feed_data(self, data):
+        assert not self._eof, 'feed_data after feed_eof'
+
+        if not data:
+            return
+
+        self._buffer.extend(data)
+
+        waiter = self._waiter
+        if waiter is not None:
+            self._waiter = None
+            if not waiter.cancelled():
+                waiter.set_result(False)
+
+        if (self._transport is not None and
+            not self._paused and
+            len(self._buffer) > 2*self._limit):
+            try:
+                self._transport.pause_reading()
+            except NotImplementedError:
+                # The transport can't be paused.
+                # We'll just have to buffer all data.
+                # Forget the transport so we don't keep trying.
+                self._transport = None
+            else:
+                self._paused = True
+
+    def _create_waiter(self, func_name):
+        # StreamReader uses a future to link the protocol feed_data() method
+        # to a read coroutine. Running two read coroutines at the same time
+        # would have an unexpected behaviour. It would not possible to know
+        # which coroutine would get the next data.
+        if self._waiter is not None:
+            raise RuntimeError('%s() called while another coroutine is '
+                               'already waiting for incoming data' % func_name)
+        return futures.Future(loop=self._loop)
+
+    @tasks.coroutine
+    def readline(self):
+        if self._exception is not None:
+            raise self._exception
+
+        line = bytearray()
+        not_enough = True
+
+        while not_enough:
+            while self._buffer and not_enough:
+                ichar = self._buffer.find(b'\n')
+                if ichar < 0:
+                    line.extend(self._buffer)
+                    self._buffer.clear()
+                else:
+                    ichar += 1
+                    line.extend(self._buffer[:ichar])
+                    del self._buffer[:ichar]
+                    not_enough = False
+
+                if len(line) > self._limit:
+                    self._maybe_resume_transport()
+                    raise ValueError('Line is too long')
+
+            if self._eof:
+                break
+
+            if not_enough:
+                self._waiter = self._create_waiter('readline')
+                try:
+                    yield from self._waiter
+                finally:
+                    self._waiter = None
+
+        self._maybe_resume_transport()
+        return bytes(line)
+
+    @tasks.coroutine
+    def read(self, n=-1):
+        if self._exception is not None:
+            raise self._exception
+
+        if not n:
+            return b''
+
+        if n < 0:
+            while not self._eof:
+                self._waiter = self._create_waiter('read')
+                try:
+                    yield from self._waiter
+                finally:
+                    self._waiter = None
+        else:
+            if not self._buffer and not self._eof:
+                self._waiter = self._create_waiter('read')
+                try:
+                    yield from self._waiter
+                finally:
+                    self._waiter = None
+
+        if n < 0 or len(self._buffer) <= n:
+            data = bytes(self._buffer)
+            self._buffer.clear()
+        else:
+            # n > 0 and len(self._buffer) > n
+            data = bytes(self._buffer[:n])
+            del self._buffer[:n]
+
+        self._maybe_resume_transport()
+        return data
+
+    @tasks.coroutine
+    def readexactly(self, n):
+        if self._exception is not None:
+            raise self._exception
+
+        # There used to be "optimized" code here.  It created its own
+        # Future and waited until self._buffer had at least the n
+        # bytes, then called read(n).  Unfortunately, this could pause
+        # the transport if the argument was larger than the pause
+        # limit (which is twice self._limit).  So now we just read()
+        # into a local buffer.
+
+        blocks = []
+        while n > 0:
+            block = yield from self.read(n)
+            if not block:
+                partial = b''.join(blocks)
+                raise IncompleteReadError(partial, len(partial) + n)
+            blocks.append(block)
+            n -= len(block)
+
+        return b''.join(blocks)
+
+File name: F:\Applications\Python34\Lib\asyncio\subprocess.py
+__doc__ is: 
+__all__ = ['create_subprocess_exec', 'create_subprocess_shell']
+
+import collections
+import subprocess
+
+from . import events
+from . import futures
+from . import protocols
+from . import streams
+from . import tasks
+
+
+PIPE = subprocess.PIPE
+STDOUT = subprocess.STDOUT
+DEVNULL = subprocess.DEVNULL
+
+
+class SubprocessStreamProtocol(streams.FlowControlMixin,
+                               protocols.SubprocessProtocol):
+    """Like StreamReaderProtocol, but for a subprocess."""
+
+    def __init__(self, limit, loop):
+        super().__init__(loop=loop)
+        self._limit = limit
+        self.stdin = self.stdout = self.stderr = None
+        self.waiter = futures.Future(loop=loop)
+        self._waiters = collections.deque()
+        self._transport = None
+
+    def connection_made(self, transport):
+        self._transport = transport
+        if transport.get_pipe_transport(1):
+            self.stdout = streams.StreamReader(limit=self._limit,
+                                               loop=self._loop)
+        if transport.get_pipe_transport(2):
+            self.stderr = streams.StreamReader(limit=self._limit,
+                                               loop=self._loop)
+        stdin = transport.get_pipe_transport(0)
+        if stdin is not None:
+            self.stdin = streams.StreamWriter(stdin,
+                                              protocol=self,
+                                              reader=None,
+                                              loop=self._loop)
+        self.waiter.set_result(None)
+
+    def pipe_data_received(self, fd, data):
+        if fd == 1:
+            reader = self.stdout
+        elif fd == 2:
+            reader = self.stderr
+        else:
+            reader = None
+        if reader is not None:
+            reader.feed_data(data)
+
+    def pipe_connection_lost(self, fd, exc):
+        if fd == 0:
+            pipe = self.stdin
+            if pipe is not None:
+                pipe.close()
+            self.connection_lost(exc)
+            return
+        if fd == 1:
+            reader = self.stdout
+        elif fd == 2:
+            reader = self.stderr
+        else:
+            reader = None
+        if reader != None:
+            if exc is None:
+                reader.feed_eof()
+            else:
+                reader.set_exception(exc)
+
+    def process_exited(self):
+        # wake up futures waiting for wait()
+        returncode = self._transport.get_returncode()
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            waiter.set_result(returncode)
+
+
+class Process:
+    def __init__(self, transport, protocol, loop):
+        self._transport = transport
+        self._protocol = protocol
+        self._loop = loop
+        self.stdin = protocol.stdin
+        self.stdout = protocol.stdout
+        self.stderr = protocol.stderr
+        self.pid = transport.get_pid()
+
+    @property
+    def returncode(self):
+        return self._transport.get_returncode()
+
+    @tasks.coroutine
+    def wait(self):
+        """Wait until the process exit and return the process return code."""
+        returncode = self._transport.get_returncode()
+        if returncode is not None:
+            return returncode
+
+        waiter = futures.Future(loop=self._loop)
+        self._protocol._waiters.append(waiter)
+        yield from waiter
+        return waiter.result()
+
+    def _check_alive(self):
+        if self._transport.get_returncode() is not None:
+            raise ProcessLookupError()
+
+    def send_signal(self, signal):
+        self._check_alive()
+        self._transport.send_signal(signal)
+
+    def terminate(self):
+        self._check_alive()
+        self._transport.terminate()
+
+    def kill(self):
+        self._check_alive()
+        self._transport.kill()
+
+    @tasks.coroutine
+    def _feed_stdin(self, input):
+        self.stdin.write(input)
+        yield from self.stdin.drain()
+        self.stdin.close()
+
+    @tasks.coroutine
+    def _noop(self):
+        return None
+
+    @tasks.coroutine
+    def _read_stream(self, fd):
+        transport = self._transport.get_pipe_transport(fd)
+        if fd == 2:
+            stream = self.stderr
+        else:
+            assert fd == 1
+            stream = self.stdout
+        output = yield from stream.read()
+        transport.close()
+        return output
+
+    @tasks.coroutine
+    def communicate(self, input=None):
+        if input:
+            stdin = self._feed_stdin(input)
+        else:
+            stdin = self._noop()
+        if self.stdout is not None:
+            stdout = self._read_stream(1)
+        else:
+            stdout = self._noop()
+        if self.stderr is not None:
+            stderr = self._read_stream(2)
+        else:
+            stderr = self._noop()
+        stdin, stdout, stderr = yield from tasks.gather(stdin, stdout, stderr,
+                                                        loop=self._loop)
+        yield from self.wait()
+        return (stdout, stderr)
+
+
+@tasks.coroutine
+def create_subprocess_shell(cmd, stdin=None, stdout=None, stderr=None,
+                            loop=None, limit=streams._DEFAULT_LIMIT, **kwds):
+    if loop is None:
+        loop = events.get_event_loop()
+    protocol_factory = lambda: SubprocessStreamProtocol(limit=limit,
+                                                        loop=loop)
+    transport, protocol = yield from loop.subprocess_shell(
+                                            protocol_factory,
+                                            cmd, stdin=stdin, stdout=stdout,
+                                            stderr=stderr, **kwds)
+    yield from protocol.waiter
+    return Process(transport, protocol, loop)
+
+@tasks.coroutine
+def create_subprocess_exec(program, *args, stdin=None, stdout=None,
+                           stderr=None, loop=None,
+                           limit=streams._DEFAULT_LIMIT, **kwds):
+    if loop is None:
+        loop = events.get_event_loop()
+    protocol_factory = lambda: SubprocessStreamProtocol(limit=limit,
+                                                        loop=loop)
+    transport, protocol = yield from loop.subprocess_exec(
+                                            protocol_factory,
+                                            program, *args,
+                                            stdin=stdin, stdout=stdout,
+                                            stderr=stderr, **kwds)
+    yield from protocol.waiter
+    return Process(transport, protocol, loop)
+
+File name: F:\Applications\Python34\Lib\asyncio\tasks.py
+__doc__ is: 
+"""Support for tasks, coroutines and the scheduler."""
+
+File name: F:\Applications\Python34\Lib\asyncio\test_utils.py
+__doc__ is: 
+"""Utilities shared by tests."""
+
+import collections
+import contextlib
+import io
+import os
+import re
+import socket
+import socketserver
+import sys
+import tempfile
+import threading
+import time
+import unittest
+import unittest.mock
+
+from http.server import HTTPServer
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer
+
+try:
+    import ssl
+except ImportError:  # pragma: no cover
+    ssl = None
+
+from . import tasks
+from . import base_events
+from . import events
+from . import selectors
+
+
+if sys.platform == 'win32':  # pragma: no cover
+    from .windows_utils import socketpair
+else:
+    from socket import socketpair  # pragma: no cover
+
+
+def dummy_ssl_context():
+    if ssl is None:
+        return None
+    else:
+        return ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+
+
+def run_briefly(loop):
+    @tasks.coroutine
+    def once():
+        pass
+    gen = once()
+    t = tasks.Task(gen, loop=loop)
+    try:
+        loop.run_until_complete(t)
+    finally:
+        gen.close()
+
+
+def run_until(loop, pred, timeout=None):
+    if timeout is not None:
+        deadline = time.time() + timeout
+    while not pred():
+        if timeout is not None:
+            timeout = deadline - time.time()
+            if timeout <= 0:
+                return False
+            loop.run_until_complete(tasks.sleep(timeout, loop=loop))
+        else:
+            run_briefly(loop)
+    return True
+
+
+def run_once(loop):
+    """loop.stop() schedules _raise_stop_error()
+    and run_forever() runs until _raise_stop_error() callback.
+    this wont work if test waits for some IO events, because
+    _raise_stop_error() runs before any of io events callbacks.
+    """
+    loop.stop()
+    loop.run_forever()
+
+
+class SilentWSGIRequestHandler(WSGIRequestHandler):
+
+    def get_stderr(self):
+        return io.StringIO()
+
+    def log_message(self, format, *args):
+        pass
+
+
+class SilentWSGIServer(WSGIServer):
+
+    def handle_error(self, request, client_address):
+        pass
+
+
+class SSLWSGIServerMixin:
+
+    def finish_request(self, request, client_address):
+        # The relative location of our test directory (which
+        # contains the ssl key and certificate files) differs
+        # between the stdlib and stand-alone asyncio.
+        # Prefer our own if we can find it.
+        here = os.path.join(os.path.dirname(__file__), '..', 'tests')
+        if not os.path.isdir(here):
+            here = os.path.join(os.path.dirname(os.__file__),
+                                'test', 'test_asyncio')
+        keyfile = os.path.join(here, 'ssl_key.pem')
+        certfile = os.path.join(here, 'ssl_cert.pem')
+        ssock = ssl.wrap_socket(request,
+                                keyfile=keyfile,
+                                certfile=certfile,
+                                server_side=True)
+        try:
+            self.RequestHandlerClass(ssock, client_address, self)
+            ssock.close()
+        except OSError:
+            # maybe socket has been closed by peer
+            pass
+
+
+class SSLWSGIServer(SSLWSGIServerMixin, SilentWSGIServer):
+    pass
+
+
+def _run_test_server(*, address, use_ssl=False, server_cls, server_ssl_cls):
+
+    def app(environ, start_response):
+        status = '200 OK'
+        headers = [('Content-type', 'text/plain')]
+        start_response(status, headers)
+        return [b'Test message']
+
+    # Run the test WSGI server in a separate thread in order not to
+    # interfere with event handling in the main thread
+    server_class = server_ssl_cls if use_ssl else server_cls
+    httpd = server_class(address, SilentWSGIRequestHandler)
+    httpd.set_app(app)
+    httpd.address = httpd.server_address
+    server_thread = threading.Thread(target=httpd.serve_forever)
+    server_thread.start()
+    try:
+        yield httpd
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        server_thread.join()
+
+
+if hasattr(socket, 'AF_UNIX'):
+
+    class UnixHTTPServer(socketserver.UnixStreamServer, HTTPServer):
+
+        def server_bind(self):
+            socketserver.UnixStreamServer.server_bind(self)
+            self.server_name = '127.0.0.1'
+            self.server_port = 80
+
+
+    class UnixWSGIServer(UnixHTTPServer, WSGIServer):
+
+        def server_bind(self):
+            UnixHTTPServer.server_bind(self)
+            self.setup_environ()
+
+        def get_request(self):
+            request, client_addr = super().get_request()
+            # Code in the stdlib expects that get_request
+            # will return a socket and a tuple (host, port).
+            # However, this isn't true for UNIX sockets,
+            # as the second return value will be a path;
+            # hence we return some fake data sufficient
+            # to get the tests going
+            return request, ('127.0.0.1', '')
+
+
+    class SilentUnixWSGIServer(UnixWSGIServer):
+
+        def handle_error(self, request, client_address):
+            pass
+
+
+    class UnixSSLWSGIServer(SSLWSGIServerMixin, SilentUnixWSGIServer):
+        pass
+
+
+    def gen_unix_socket_path():
+        with tempfile.NamedTemporaryFile() as file:
+            return file.name
+
+
+    @contextlib.contextmanager
+    def unix_socket_path():
+        path = gen_unix_socket_path()
+        try:
+            yield path
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+    @contextlib.contextmanager
+    def run_test_unix_server(*, use_ssl=False):
+        with unix_socket_path() as path:
+            yield from _run_test_server(address=path, use_ssl=use_ssl,
+                                        server_cls=SilentUnixWSGIServer,
+                                        server_ssl_cls=UnixSSLWSGIServer)
+
+
+@contextlib.contextmanager
+def run_test_server(*, host='127.0.0.1', port=0, use_ssl=False):
+    yield from _run_test_server(address=(host, port), use_ssl=use_ssl,
+                                server_cls=SilentWSGIServer,
+                                server_ssl_cls=SSLWSGIServer)
+
+
+def make_test_protocol(base):
+    dct = {}
+    for name in dir(base):
+        if name.startswith('__') and name.endswith('__'):
+            # skip magic names
+            continue
+        dct[name] = MockCallback(return_value=None)
+    return type('TestProtocol', (base,) + base.__bases__, dct)()
+
+
+class TestSelector(selectors.BaseSelector):
+
+    def __init__(self):
+        self.keys = {}
+
+    def register(self, fileobj, events, data=None):
+        key = selectors.SelectorKey(fileobj, 0, events, data)
+        self.keys[fileobj] = key
+        return key
+
+    def unregister(self, fileobj):
+        return self.keys.pop(fileobj)
+
+    def select(self, timeout):
+        return []
+
+    def get_map(self):
+        return self.keys
+
+
+class TestLoop(base_events.BaseEventLoop):
+    """Loop for unittests.
+
+    It manages self time directly.
+    If something scheduled to be executed later then
+    on next loop iteration after all ready handlers done
+    generator passed to __init__ is calling.
+
+    Generator should be like this:
+
+        def gen():
+            ...
+            when = yield ...
+            ... = yield time_advance
+
+    Value returned by yield is absolute time of next scheduled handler.
+    Value passed to yield is time advance to move loop's time forward.
+    """
+
+    def __init__(self, gen=None):
+        super().__init__()
+
+        if gen is None:
+            def gen():
+                yield
+            self._check_on_close = False
+        else:
+            self._check_on_close = True
+
+        self._gen = gen()
+        next(self._gen)
+        self._time = 0
+        self._clock_resolution = 1e-9
+        self._timers = []
+        self._selector = TestSelector()
+
+        self.readers = {}
+        self.writers = {}
+        self.reset_counters()
+
+    def time(self):
+        return self._time
+
+    def advance_time(self, advance):
+        """Move test time forward."""
+        if advance:
+            self._time += advance
+
+    def close(self):
+        if self._check_on_close:
+            try:
+                self._gen.send(0)
+            except StopIteration:
+                pass
+            else:  # pragma: no cover
+                raise AssertionError("Time generator is not finished")
+
+    def add_reader(self, fd, callback, *args):
+        self.readers[fd] = events.Handle(callback, args, self)
+
+    def remove_reader(self, fd):
+        self.remove_reader_count[fd] += 1
+        if fd in self.readers:
+            del self.readers[fd]
+            return True
+        else:
+            return False
+
+    def assert_reader(self, fd, callback, *args):
+        assert fd in self.readers, 'fd {} is not registered'.format(fd)
+        handle = self.readers[fd]
+        assert handle._callback == callback, '{!r} != {!r}'.format(
+            handle._callback, callback)
+        assert handle._args == args, '{!r} != {!r}'.format(
+            handle._args, args)
+
+    def add_writer(self, fd, callback, *args):
+        self.writers[fd] = events.Handle(callback, args, self)
+
+    def remove_writer(self, fd):
+        self.remove_writer_count[fd] += 1
+        if fd in self.writers:
+            del self.writers[fd]
+            return True
+        else:
+            return False
+
+    def assert_writer(self, fd, callback, *args):
+        assert fd in self.writers, 'fd {} is not registered'.format(fd)
+        handle = self.writers[fd]
+        assert handle._callback == callback, '{!r} != {!r}'.format(
+            handle._callback, callback)
+        assert handle._args == args, '{!r} != {!r}'.format(
+            handle._args, args)
+
+    def reset_counters(self):
+        self.remove_reader_count = collections.defaultdict(int)
+        self.remove_writer_count = collections.defaultdict(int)
+
+    def _run_once(self):
+        super()._run_once()
+        for when in self._timers:
+            advance = self._gen.send(when)
+            self.advance_time(advance)
+        self._timers = []
+
+    def call_at(self, when, callback, *args):
+        self._timers.append(when)
+        return super().call_at(when, callback, *args)
+
+    def _process_events(self, event_list):
+        return
+
+    def _write_to_self(self):
+        pass
+
+
+def MockCallback(**kwargs):
+    return unittest.mock.Mock(spec=['__call__'], **kwargs)
+
+
+class MockPattern(str):
+    """A regex based str with a fuzzy __eq__.
+
+    Use this helper with 'mock.assert_called_with', or anywhere
+    where a regex comparison between strings is needed.
+
+    For instance:
+       mock_call.assert_called_with(MockPattern('spam.*ham'))
+    """
+    def __eq__(self, other):
+        return bool(re.search(str(self), other, re.S))
+
+File name: F:\Applications\Python34\Lib\asyncio\transports.py
+__doc__ is: 
+"""Abstract Transport class."""
+
+File name: F:\Applications\Python34\Lib\asyncio\unix_events.py
+__doc__ is: 
+"""Selector event loop for Unix with signal handling."""
+
+import errno
+import fcntl
+import os
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import threading
+
+
+from . import base_events
+from . import base_subprocess
+from . import constants
+from . import events
+from . import selector_events
+from . import tasks
+from . import transports
+from .log import logger
+
+
+__all__ = ['SelectorEventLoop',
+           'AbstractChildWatcher', 'SafeChildWatcher',
+           'FastChildWatcher', 'DefaultEventLoopPolicy',
+           ]
+
+if sys.platform == 'win32':  # pragma: no cover
+    raise ImportError('Signals are not really supported on Windows')
+
+
+class _UnixSelectorEventLoop(selector_events.BaseSelectorEventLoop):
+    """Unix event loop.
+
+    Adds signal handling and UNIX Domain Socket support to SelectorEventLoop.
+    """
+
+    def __init__(self, selector=None):
+        super().__init__(selector)
+        self._signal_handlers = {}
+
+    def _socketpair(self):
+        return socket.socketpair()
+
+    def close(self):
+        for sig in list(self._signal_handlers):
+            self.remove_signal_handler(sig)
+        super().close()
+
+    def add_signal_handler(self, sig, callback, *args):
+        """Add a handler for a signal.  UNIX only.
+
+        Raise ValueError if the signal number is invalid or uncatchable.
+        Raise RuntimeError if there is a problem setting up the handler.
+        """
+        self._check_signal(sig)
+        try:
+            # set_wakeup_fd() raises ValueError if this is not the
+            # main thread.  By calling it early we ensure that an
+            # event loop running in another thread cannot add a signal
+            # handler.
+            signal.set_wakeup_fd(self._csock.fileno())
+        except ValueError as exc:
+            raise RuntimeError(str(exc))
+
+        handle = events.Handle(callback, args, self)
+        self._signal_handlers[sig] = handle
+
+        try:
+            signal.signal(sig, self._handle_signal)
+            # Set SA_RESTART to limit EINTR occurrences.
+            signal.siginterrupt(sig, False)
+        except OSError as exc:
+            del self._signal_handlers[sig]
+            if not self._signal_handlers:
+                try:
+                    signal.set_wakeup_fd(-1)
+                except ValueError as nexc:
+                    logger.info('set_wakeup_fd(-1) failed: %s', nexc)
+
+            if exc.errno == errno.EINVAL:
+                raise RuntimeError('sig {} cannot be caught'.format(sig))
+            else:
+                raise
+
+    def _handle_signal(self, sig, arg):
+        """Internal helper that is the actual signal handler."""
+        handle = self._signal_handlers.get(sig)
+        if handle is None:
+            return  # Assume it's some race condition.
+        if handle._cancelled:
+            self.remove_signal_handler(sig)  # Remove it properly.
+        else:
+            self._add_callback_signalsafe(handle)
+
+    def remove_signal_handler(self, sig):
+        """Remove a handler for a signal.  UNIX only.
+
+        Return True if a signal handler was removed, False if not.
+        """
+        self._check_signal(sig)
+        try:
+            del self._signal_handlers[sig]
+        except KeyError:
+            return False
+
+        if sig == signal.SIGINT:
+            handler = signal.default_int_handler
+        else:
+            handler = signal.SIG_DFL
+
+        try:
+            signal.signal(sig, handler)
+        except OSError as exc:
+            if exc.errno == errno.EINVAL:
+                raise RuntimeError('sig {} cannot be caught'.format(sig))
+            else:
+                raise
+
+        if not self._signal_handlers:
+            try:
+                signal.set_wakeup_fd(-1)
+            except ValueError as exc:
+                logger.info('set_wakeup_fd(-1) failed: %s', exc)
+
+        return True
+
+    def _check_signal(self, sig):
+        """Internal helper to validate a signal.
+
+        Raise ValueError if the signal number is invalid or uncatchable.
+        Raise RuntimeError if there is a problem setting up the handler.
+        """
+        if not isinstance(sig, int):
+            raise TypeError('sig must be an int, not {!r}'.format(sig))
+
+        if not (1 <= sig < signal.NSIG):
+            raise ValueError(
+                'sig {} out of range(1, {})'.format(sig, signal.NSIG))
+
+    def _make_read_pipe_transport(self, pipe, protocol, waiter=None,
+                                  extra=None):
+        return _UnixReadPipeTransport(self, pipe, protocol, waiter, extra)
+
+    def _make_write_pipe_transport(self, pipe, protocol, waiter=None,
+                                   extra=None):
+        return _UnixWritePipeTransport(self, pipe, protocol, waiter, extra)
+
+    @tasks.coroutine
+    def _make_subprocess_transport(self, protocol, args, shell,
+                                   stdin, stdout, stderr, bufsize,
+                                   extra=None, **kwargs):
+        with events.get_child_watcher() as watcher:
+            transp = _UnixSubprocessTransport(self, protocol, args, shell,
+                                              stdin, stdout, stderr, bufsize,
+                                              extra=extra, **kwargs)
+            yield from transp._post_init()
+            watcher.add_child_handler(transp.get_pid(),
+                                      self._child_watcher_callback, transp)
+
+        return transp
+
+    def _child_watcher_callback(self, pid, returncode, transp):
+        self.call_soon_threadsafe(transp._process_exited, returncode)
+
+    @tasks.coroutine
+    def create_unix_connection(self, protocol_factory, path, *,
+                               ssl=None, sock=None,
+                               server_hostname=None):
+        assert server_hostname is None or isinstance(server_hostname, str)
+        if ssl:
+            if server_hostname is None:
+                raise ValueError(
+                    'you have to pass server_hostname when using ssl')
+        else:
+            if server_hostname is not None:
+                raise ValueError('server_hostname is only meaningful with ssl')
+
+        if path is not None:
+            if sock is not None:
+                raise ValueError(
+                    'path and sock can not be specified at the same time')
+
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0)
+            try:
+                sock.setblocking(False)
+                yield from self.sock_connect(sock, path)
+            except:
+                sock.close()
+                raise
+
+        else:
+            if sock is None:
+                raise ValueError('no path and sock were specified')
+            sock.setblocking(False)
+
+        transport, protocol = yield from self._create_connection_transport(
+            sock, protocol_factory, ssl, server_hostname)
+        return transport, protocol
+
+    @tasks.coroutine
+    def create_unix_server(self, protocol_factory, path=None, *,
+                           sock=None, backlog=100, ssl=None):
+        if isinstance(ssl, bool):
+            raise TypeError('ssl argument must be an SSLContext or None')
+
+        if path is not None:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+            try:
+                sock.bind(path)
+            except OSError as exc:
+                sock.close()
+                if exc.errno == errno.EADDRINUSE:
+                    # Let's improve the error message by adding
+                    # with what exact address it occurs.
+                    msg = 'Address {!r} is already in use'.format(path)
+                    raise OSError(errno.EADDRINUSE, msg) from None
+                else:
+                    raise
+        else:
+            if sock is None:
+                raise ValueError(
+                    'path was not specified, and no sock specified')
+
+            if sock.family != socket.AF_UNIX:
+                raise ValueError(
+                    'A UNIX Domain Socket was expected, got {!r}'.format(sock))
+
+        server = base_events.Server(self, [sock])
+        sock.listen(backlog)
+        sock.setblocking(False)
+        self._start_serving(protocol_factory, sock, ssl, server)
+        return server
+
+
+def _set_nonblocking(fd):
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    flags = flags | os.O_NONBLOCK
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags)
+
+
+class _UnixReadPipeTransport(transports.ReadTransport):
+
+    max_size = 256 * 1024  # max bytes we read in one event loop iteration
+
+    def __init__(self, loop, pipe, protocol, waiter=None, extra=None):
+        super().__init__(extra)
+        self._extra['pipe'] = pipe
+        self._loop = loop
+        self._pipe = pipe
+        self._fileno = pipe.fileno()
+        mode = os.fstat(self._fileno).st_mode
+        if not (stat.S_ISFIFO(mode) or
+                stat.S_ISSOCK(mode) or
+                stat.S_ISCHR(mode)):
+            raise ValueError("Pipe transport is for pipes/sockets only.")
+        _set_nonblocking(self._fileno)
+        self._protocol = protocol
+        self._closing = False
+        self._loop.add_reader(self._fileno, self._read_ready)
+        self._loop.call_soon(self._protocol.connection_made, self)
+        if waiter is not None:
+            self._loop.call_soon(waiter.set_result, None)
+
+    def _read_ready(self):
+        try:
+            data = os.read(self._fileno, self.max_size)
+        except (BlockingIOError, InterruptedError):
+            pass
+        except OSError as exc:
+            self._fatal_error(exc, 'Fatal read error on pipe transport')
+        else:
+            if data:
+                self._protocol.data_received(data)
+            else:
+                self._closing = True
+                self._loop.remove_reader(self._fileno)
+                self._loop.call_soon(self._protocol.eof_received)
+                self._loop.call_soon(self._call_connection_lost, None)
+
+    def pause_reading(self):
+        self._loop.remove_reader(self._fileno)
+
+    def resume_reading(self):
+        self._loop.add_reader(self._fileno, self._read_ready)
+
+    def close(self):
+        if not self._closing:
+            self._close(None)
+
+    def _fatal_error(self, exc, message='Fatal error on pipe transport'):
+        # should be called by exception handler only
+        if not (isinstance(exc, OSError) and exc.errno == errno.EIO):
+            self._loop.call_exception_handler({
+                'message': message,
+                'exception': exc,
+                'transport': self,
+                'protocol': self._protocol,
+            })
+        self._close(exc)
+
+    def _close(self, exc):
+        self._closing = True
+        self._loop.remove_reader(self._fileno)
+        self._loop.call_soon(self._call_connection_lost, exc)
+
+    def _call_connection_lost(self, exc):
+        try:
+            self._protocol.connection_lost(exc)
+        finally:
+            self._pipe.close()
+            self._pipe = None
+            self._protocol = None
+            self._loop = None
+
+
+class _UnixWritePipeTransport(transports._FlowControlMixin,
+                              transports.WriteTransport):
+
+    def __init__(self, loop, pipe, protocol, waiter=None, extra=None):
+        super().__init__(extra)
+        self._extra['pipe'] = pipe
+        self._loop = loop
+        self._pipe = pipe
+        self._fileno = pipe.fileno()
+        mode = os.fstat(self._fileno).st_mode
+        is_socket = stat.S_ISSOCK(mode)
+        if not (is_socket or
+                stat.S_ISFIFO(mode) or
+                stat.S_ISCHR(mode)):
+            raise ValueError("Pipe transport is only for "
+                             "pipes, sockets and character devices")
+        _set_nonblocking(self._fileno)
+        self._protocol = protocol
+        self._buffer = []
+        self._conn_lost = 0
+        self._closing = False  # Set when close() or write_eof() called.
+
+        # On AIX, the reader trick only works for sockets.
+        # On other platforms it works for pipes and sockets.
+        # (Exception: OS X 10.4?  Issue #19294.)
+        if is_socket or not sys.platform.startswith("aix"):
+            self._loop.add_reader(self._fileno, self._read_ready)
+
+        self._loop.call_soon(self._protocol.connection_made, self)
+        if waiter is not None:
+            self._loop.call_soon(waiter.set_result, None)
+
+    def get_write_buffer_size(self):
+        return sum(len(data) for data in self._buffer)
+
+    def _read_ready(self):
+        # Pipe was closed by peer.
+        if self._buffer:
+            self._close(BrokenPipeError())
+        else:
+            self._close()
+
+    def write(self, data):
+        assert isinstance(data, (bytes, bytearray, memoryview)), repr(data)
+        if isinstance(data, bytearray):
+            data = memoryview(data)
+        if not data:
+            return
+
+        if self._conn_lost or self._closing:
+            if self._conn_lost >= constants.LOG_THRESHOLD_FOR_CONNLOST_WRITES:
+                logger.warning('pipe closed by peer or '
+                               'os.write(pipe, data) raised exception.')
+            self._conn_lost += 1
+            return
+
+        if not self._buffer:
+            # Attempt to send it right away first.
+            try:
+                n = os.write(self._fileno, data)
+            except (BlockingIOError, InterruptedError):
+                n = 0
+            except Exception as exc:
+                self._conn_lost += 1
+                self._fatal_error(exc, 'Fatal write error on pipe transport')
+                return
+            if n == len(data):
+                return
+            elif n > 0:
+                data = data[n:]
+            self._loop.add_writer(self._fileno, self._write_ready)
+
+        self._buffer.append(data)
+        self._maybe_pause_protocol()
+
+    def _write_ready(self):
+        data = b''.join(self._buffer)
+        assert data, 'Data should not be empty'
+
+        self._buffer.clear()
+        try:
+            n = os.write(self._fileno, data)
+        except (BlockingIOError, InterruptedError):
+            self._buffer.append(data)
+        except Exception as exc:
+            self._conn_lost += 1
+            # Remove writer here, _fatal_error() doesn't it
+            # because _buffer is empty.
+            self._loop.remove_writer(self._fileno)
+            self._fatal_error(exc, 'Fatal write error on pipe transport')
+        else:
+            if n == len(data):
+                self._loop.remove_writer(self._fileno)
+                self._maybe_resume_protocol()  # May append to buffer.
+                if not self._buffer and self._closing:
+                    self._loop.remove_reader(self._fileno)
+                    self._call_connection_lost(None)
+                return
+            elif n > 0:
+                data = data[n:]
+
+            self._buffer.append(data)  # Try again later.
+
+    def can_write_eof(self):
+        return True
+
+    # TODO: Make the relationships between write_eof(), close(),
+    # abort(), _fatal_error() and _close() more straightforward.
+
+    def write_eof(self):
+        if self._closing:
+            return
+        assert self._pipe
+        self._closing = True
+        if not self._buffer:
+            self._loop.remove_reader(self._fileno)
+            self._loop.call_soon(self._call_connection_lost, None)
+
+    def close(self):
+        if not self._closing:
+            # write_eof is all what we needed to close the write pipe
+            self.write_eof()
+
+    def abort(self):
+        self._close(None)
+
+    def _fatal_error(self, exc, message='Fatal error on pipe transport'):
+        # should be called by exception handler only
+        if not isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            self._loop.call_exception_handler({
+                'message': message,
+                'exception': exc,
+                'transport': self,
+                'protocol': self._protocol,
+            })
+        self._close(exc)
+
+    def _close(self, exc=None):
+        self._closing = True
+        if self._buffer:
+            self._loop.remove_writer(self._fileno)
+        self._buffer.clear()
+        self._loop.remove_reader(self._fileno)
+        self._loop.call_soon(self._call_connection_lost, exc)
+
+    def _call_connection_lost(self, exc):
+        try:
+            self._protocol.connection_lost(exc)
+        finally:
+            self._pipe.close()
+            self._pipe = None
+            self._protocol = None
+            self._loop = None
+
+
+class _UnixSubprocessTransport(base_subprocess.BaseSubprocessTransport):
+
+    def _start(self, args, shell, stdin, stdout, stderr, bufsize, **kwargs):
+        stdin_w = None
+        if stdin == subprocess.PIPE:
+            # Use a socket pair for stdin, since not all platforms
+            # support selecting read events on the write end of a
+            # socket (which we use in order to detect closing of the
+            # other end).  Notably this is needed on AIX, and works
+            # just fine on other platforms.
+            stdin, stdin_w = self._loop._socketpair()
+        self._proc = subprocess.Popen(
+            args, shell=shell, stdin=stdin, stdout=stdout, stderr=stderr,
+            universal_newlines=False, bufsize=bufsize, **kwargs)
+        if stdin_w is not None:
+            stdin.close()
+            self._proc.stdin = open(stdin_w.detach(), 'rb', buffering=bufsize)
+
+
+class AbstractChildWatcher:
+    """Abstract base class for monitoring child processes.
+
+    Objects derived from this class monitor a collection of subprocesses and
+    report their termination or interruption by a signal.
+
+    New callbacks are registered with .add_child_handler(). Starting a new
+    process must be done within a 'with' block to allow the watcher to suspend
+    its activity until the new process if fully registered (this is needed to
+    prevent a race condition in some implementations).
+
+    Example:
+        with watcher:
+            proc = subprocess.Popen("sleep 1")
+            watcher.add_child_handler(proc.pid, callback)
+
+    Notes:
+        Implementations of this class must be thread-safe.
+
+        Since child watcher objects may catch the SIGCHLD signal and call
+        waitpid(-1), there should be only one active object per process.
+    """
+
+    def add_child_handler(self, pid, callback, *args):
+        """Register a new child handler.
+
+        Arrange for callback(pid, returncode, *args) to be called when
+        process 'pid' terminates. Specifying another callback for the same
+        process replaces the previous handler.
+
+        Note: callback() must be thread-safe
+        """
+        raise NotImplementedError()
+
+    def remove_child_handler(self, pid):
+        """Removes the handler for process 'pid'.
+
+        The function returns True if the handler was successfully removed,
+        False if there was nothing to remove."""
+
+        raise NotImplementedError()
+
+    def attach_loop(self, loop):
+        """Attach the watcher to an event loop.
+
+        If the watcher was previously attached to an event loop, then it is
+        first detached before attaching to the new loop.
+
+        Note: loop may be None.
+        """
+        raise NotImplementedError()
+
+    def close(self):
+        """Close the watcher.
+
+        This must be called to make sure that any underlying resource is freed.
+        """
+        raise NotImplementedError()
+
+    def __enter__(self):
+        """Enter the watcher's context and allow starting new processes
+
+        This function must return self"""
+        raise NotImplementedError()
+
+    def __exit__(self, a, b, c):
+        """Exit the watcher's context"""
+        raise NotImplementedError()
+
+
+class BaseChildWatcher(AbstractChildWatcher):
+
+    def __init__(self):
+        self._loop = None
+
+    def close(self):
+        self.attach_loop(None)
+
+    def _do_waitpid(self, expected_pid):
+        raise NotImplementedError()
+
+    def _do_waitpid_all(self):
+        raise NotImplementedError()
+
+    def attach_loop(self, loop):
+        assert loop is None or isinstance(loop, events.AbstractEventLoop)
+
+        if self._loop is not None:
+            self._loop.remove_signal_handler(signal.SIGCHLD)
+
+        self._loop = loop
+        if loop is not None:
+            loop.add_signal_handler(signal.SIGCHLD, self._sig_chld)
+
+            # Prevent a race condition in case a child terminated
+            # during the switch.
+            self._do_waitpid_all()
+
+    def _sig_chld(self):
+        try:
+            self._do_waitpid_all()
+        except Exception as exc:
+            # self._loop should always be available here
+            # as '_sig_chld' is added as a signal handler
+            # in 'attach_loop'
+            self._loop.call_exception_handler({
+                'message': 'Unknown exception in SIGCHLD handler',
+                'exception': exc,
+            })
+
+    def _compute_returncode(self, status):
+        if os.WIFSIGNALED(status):
+            # The child process died because of a signal.
+            return -os.WTERMSIG(status)
+        elif os.WIFEXITED(status):
+            # The child process exited (e.g sys.exit()).
+            return os.WEXITSTATUS(status)
+        else:
+            # The child exited, but we don't understand its status.
+            # This shouldn't happen, but if it does, let's just
+            # return that status; perhaps that helps debug it.
+            return status
+
+
+class SafeChildWatcher(BaseChildWatcher):
+    """'Safe' child watcher implementation.
+
+    This implementation avoids disrupting other code spawning processes by
+    polling explicitly each process in the SIGCHLD handler instead of calling
+    os.waitpid(-1).
+
+    This is a safe solution but it has a significant overhead when handling a
+    big number of children (O(n) each time SIGCHLD is raised)
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._callbacks = {}
+
+    def close(self):
+        self._callbacks.clear()
+        super().close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, a, b, c):
+        pass
+
+    def add_child_handler(self, pid, callback, *args):
+        self._callbacks[pid] = callback, args
+
+        # Prevent a race condition in case the child is already terminated.
+        self._do_waitpid(pid)
+
+    def remove_child_handler(self, pid):
+        try:
+            del self._callbacks[pid]
+            return True
+        except KeyError:
+            return False
+
+    def _do_waitpid_all(self):
+
+        for pid in list(self._callbacks):
+            self._do_waitpid(pid)
+
+    def _do_waitpid(self, expected_pid):
+        assert expected_pid > 0
+
+        try:
+            pid, status = os.waitpid(expected_pid, os.WNOHANG)
+        except ChildProcessError:
+            # The child process is already reaped
+            # (may happen if waitpid() is called elsewhere).
+            pid = expected_pid
+            returncode = 255
+            logger.warning(
+                "Unknown child process pid %d, will report returncode 255",
+                pid)
+        else:
+            if pid == 0:
+                # The child process is still alive.
+                return
+
+            returncode = self._compute_returncode(status)
+
+        try:
+            callback, args = self._callbacks.pop(pid)
+        except KeyError:  # pragma: no cover
+            # May happen if .remove_child_handler() is called
+            # after os.waitpid() returns.
+            pass
+        else:
+            callback(pid, returncode, *args)
+
+
+class FastChildWatcher(BaseChildWatcher):
+    """'Fast' child watcher implementation.
+
+    This implementation reaps every terminated processes by calling
+    os.waitpid(-1) directly, possibly breaking other code spawning processes
+    and waiting for their termination.
+
+    There is no noticeable overhead when handling a big number of children
+    (O(1) each time a child terminates).
+    """
+    def __init__(self):
+        super().__init__()
+        self._callbacks = {}
+        self._lock = threading.Lock()
+        self._zombies = {}
+        self._forks = 0
+
+    def close(self):
+        self._callbacks.clear()
+        self._zombies.clear()
+        super().close()
+
+    def __enter__(self):
+        with self._lock:
+            self._forks += 1
+
+            return self
+
+    def __exit__(self, a, b, c):
+        with self._lock:
+            self._forks -= 1
+
+            if self._forks or not self._zombies:
+                return
+
+            collateral_victims = str(self._zombies)
+            self._zombies.clear()
+
+        logger.warning(
+            "Caught subprocesses termination from unknown pids: %s",
+            collateral_victims)
+
+    def add_child_handler(self, pid, callback, *args):
+        assert self._forks, "Must use the context manager"
+        with self._lock:
+            try:
+                returncode = self._zombies.pop(pid)
+            except KeyError:
+                # The child is running.
+                self._callbacks[pid] = callback, args
+                return
+
+        # The child is dead already. We can fire the callback.
+        callback(pid, returncode, *args)
+
+    def remove_child_handler(self, pid):
+        try:
+            del self._callbacks[pid]
+            return True
+        except KeyError:
+            return False
+
+    def _do_waitpid_all(self):
+        # Because of signal coalescing, we must keep calling waitpid() as
+        # long as we're able to reap a child.
+        while True:
+            try:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                # No more child processes exist.
+                return
+            else:
+                if pid == 0:
+                    # A child process is still alive.
+                    return
+
+                returncode = self._compute_returncode(status)
+
+            with self._lock:
+                try:
+                    callback, args = self._callbacks.pop(pid)
+                except KeyError:
+                    # unknown child
+                    if self._forks:
+                        # It may not be registered yet.
+                        self._zombies[pid] = returncode
+                        continue
+                    callback = None
+
+            if callback is None:
+                logger.warning(
+                    "Caught subprocess termination from unknown pid: "
+                    "%d -> %d", pid, returncode)
+            else:
+                callback(pid, returncode, *args)
+
+
+class _UnixDefaultEventLoopPolicy(events.BaseDefaultEventLoopPolicy):
+    """XXX"""
+    _loop_factory = _UnixSelectorEventLoop
+
+    def __init__(self):
+        super().__init__()
+        self._watcher = None
+
+    def _init_watcher(self):
+        with events._lock:
+            if self._watcher is None:  # pragma: no branch
+                self._watcher = SafeChildWatcher()
+                if isinstance(threading.current_thread(),
+                              threading._MainThread):
+                    self._watcher.attach_loop(self._local._loop)
+
+    def set_event_loop(self, loop):
+        """Set the event loop.
+
+        As a side effect, if a child watcher was set before, then calling
+        .set_event_loop() from the main thread will call .attach_loop(loop) on
+        the child watcher.
+        """
+
+        super().set_event_loop(loop)
+
+        if self._watcher is not None and \
+            isinstance(threading.current_thread(), threading._MainThread):
+            self._watcher.attach_loop(loop)
+
+    def get_child_watcher(self):
+        """Get the child watcher
+
+        If not yet set, a SafeChildWatcher object is automatically created.
+        """
+        if self._watcher is None:
+            self._init_watcher()
+
+        return self._watcher
+
+    def set_child_watcher(self, watcher):
+        """Set the child watcher"""
+
+        assert watcher is None or isinstance(watcher, AbstractChildWatcher)
+
+        if self._watcher is not None:
+            self._watcher.close()
+
+        self._watcher = watcher
+
+SelectorEventLoop = _UnixSelectorEventLoop
+DefaultEventLoopPolicy = _UnixDefaultEventLoopPolicy
+
+File name: F:\Applications\Python34\Lib\asyncio\windows_events.py
+__doc__ is: 
+"""Selector and proactor event loops for Windows."""
+
+File name: F:\Applications\Python34\Lib\asyncio\windows_utils.py
+__doc__ is: 
+"""
+Various Windows specific bits and pieces
+"""
+
+File name: F:\Applications\Python34\Lib\asyncio\__init__.py
+__doc__ is: 
+"""The asyncio package, tracking PEP 3156."""
+
+import sys
+
+# The selectors module is in the stdlib in Python 3.4 but not in 3.3.
+# Do this first, so the other submodules can use "from . import selectors".
+# Prefer asyncio/selectors.py over the stdlib one, as ours may be newer.
+try:
+    from . import selectors
+except ImportError:
+    import selectors  # Will also be exported.
+
+if sys.platform == 'win32':
+    # Similar thing for _overlapped.
+    try:
+        from . import _overlapped
+    except ImportError:
+        import _overlapped  # Will also be exported.
+
+# This relies on each of the submodules having an __all__ variable.
+from .events import *
+from .futures import *
+from .locks import *
+from .protocols import *
+from .queues import *
+from .streams import *
+from .subprocess import *
+from .tasks import *
+from .transports import *
+
+if sys.platform == 'win32':  # pragma: no cover
+    from .windows_events import *
+else:
+    from .unix_events import *  # pragma: no cover
+
+
+__all__ = (events.__all__ +
+           futures.__all__ +
+           locks.__all__ +
+           protocols.__all__ +
+           queues.__all__ +
+           streams.__all__ +
+           subprocess.__all__ +
+           tasks.__all__ +
+           transports.__all__)
+
