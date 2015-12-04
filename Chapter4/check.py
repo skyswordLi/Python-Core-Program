@@ -9,4 +9,4 @@ check1 = a is b
 check2 = c is d
 check3 = e is f
 
-print( check1, check2, check3 )
+print check1, check2, check3

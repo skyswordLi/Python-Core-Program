@@ -1,5 +1,5 @@
-fileName = raw_input( 'Enter file name:' )
-fobj     = open( fileName, 'r' )
-for eachLine in fobj:
-    print( eachLine )
+fileName = raw_input('Enter file name:')
+file_obj = open(fileName, 'r')
+for eachLine in file_obj:
+    print eachLine
 fobj.close()

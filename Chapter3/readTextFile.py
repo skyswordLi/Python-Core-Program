@@ -1,15 +1,13 @@
 # get filename
-fname = raw_input( 'Enter filename:' )
-
-print
+fileName = raw_input('Enter filename:')
 
 # attempt to open file for reading
 try:
-    fobj = open( fname, 'r' )
+    fileObject = open(fileName, 'r')
 except IOError:
-    print( "*** file open error!" )
+    print "*** file open error!"
 else:
     # display contents to screen
-    for eachLine in fobj:
-        print( eachLine )
-    fobj.close()
+    for eachLine in fileObject:
+        print eachLine
+    fileObject.close()

@@ -1,29 +1,29 @@
 import os
 
-ls = os.linesep;
+ls = os.linesep
 
-fname = raw_input( "filename = " )
+fileName = raw_input("filename = ")
 # get filenames
 while True:
-    if os.path.exists( fname ):
-        print( "ERROR: %s already exits." % ( fname ) )
+    if os.path.exists(fileName):
+        print"ERROR: %s already exits." % fileName
     else:
         break
 
 # get file content (text) lines
 all = []
-print( "\nEnter lines ('.' by itself to quit)." )
+print "\nEnter lines ('.' by itself to quit)."
 
 # loop until user terminate input
 while True:
-    entry = raw_input( '>>>' )
+    entry = raw_input('>>>')
     if entry == '.':
         break
     else:
-        all.append( entry )
+        all.append(entry)
 
 # write lines to file with proper line-ending
-fobj = open( fname, 'w' )
-fobj.writelines( ["%s%s" % ( x, ls ) for x in all] )
-fobj.close()
-print( "DONE!" )
+fileObject = open(fileName, 'w')
+fileObject.writelines(["%s%s" % (x, ls) for x in all])
+fileObject.close()
+print "DONE!"

@@ -1,13 +1,15 @@
-magic = 45
+import random
 
-print( "Please enter a number between 1 and 100 to guess:" )
+magic = random.randint(1, 100)
+
+print "Please enter a number between 1 and 100 to guess:"
 
 while True:
-    number = int( input( "number = " ) )
+    number = int(raw_input("number = "))
     if number == magic:
-        print( "Haaaaa! You are right! Excellent! Bye!" )
+        print "Haaaaa! You are right! Excellent! Bye!"
         break;
     elif number < magic:
-        print( "Sorry, too small! Try again!" )
+        print "Sorry, too small! Try again!"
     else:
-        print( "Sorry, too large! Try agian!" )
+        print "Sorry, too large! Try again!"

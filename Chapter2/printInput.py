@@ -1,4 +1,4 @@
-string = raw_input( "string = " )
-number = int( raw_input( "number = " ) )
+string = raw_input("string = ")
+number = int(raw_input("number = "))
 
-print( "You have entered %s and %d" % ( string, number ) )
+print "You have entered %s and %d" % (string, number)

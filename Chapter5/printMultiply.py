@@ -1,7 +1,12 @@
-def multiply( oprnd1, oprnd2 ):
-    return oprnd1 * oprnd2
+def multiply(operand1, operand):
+    return operand1 * operand
 
-def printResult():
-    num1 = float( raw_input( "num1 = " ) )
-    num2 = float( raw_input( "num2 = " ) )
-    print( multiply( num1, num2 ) )
+
+def print_result():
+    num1 = float(raw_input("num1 = "))
+    num2 = float(raw_input("num2 = "))
+    print multiply(num1, num2 )
+
+
+if '__main__' == __name__:
+    print_result()
