@@ -1,17 +1,17 @@
-def tr( srcstr, dststr, string, sensitive ):
-    lens = len( srcstr )
-    src, dst, stri = srcstr, dststr, string
+def tr(src_str, dst_str, string, sensitive):
+    lens = len(src_str)
+    src, dst, my_str = src_str, dst_str, string
 
     if not sensitive:
-        src, dst, str1 = srcstr.lower(), dst.lower(), stri.lower()
+        src, dst, str1 = src_str.lower(), dst.lower(), my_str.lower()
     while True:
-        index = stri.find( src )
+        index = my_str.find(src)
         if index > -1:
-            string = string[ 0 : index ] + dststr + string[ index + lens : ]
+            string = string[0:index] + dst_str + string[index + lens:]
             if not sensitive:
-                stri = stri[ 0 : index ] + dst + stri[ index + lens : ]
+                my_str = my_str[0:index ] + dst + my_str[index + lens:]
             else:
-                stri = string
+                my_str = string
         else:
             break
     return string

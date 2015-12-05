@@ -1,8 +1,8 @@
-def fab( N ):
+def fab(n):
     result = 1
-    for i in range( 1, N + 1 ):
+    for i in range(1, n + 1):
         result *= i
     return result
 
 if __name__ == '__main__':
-    print( fab( 10 ) )
+    print fab(10)

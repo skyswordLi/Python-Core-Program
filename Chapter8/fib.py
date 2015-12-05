@@ -1,6 +1,7 @@
 # Fibonacci numbers module
 import sys
 
+
 def fib(n):    # write Fibonacci series up to n
     a, b = 0, 1
     while b < n:
@@ -8,7 +9,8 @@ def fib(n):    # write Fibonacci series up to n
         a, b = b, a+b
     print ''
 
-def fib2(n): # return Fibonacci series up to n
+
+def fib2(n):   # return Fibonacci series up to n
     result = []
     a, b = 0, 1
     while b < n:
@@ -17,4 +19,5 @@ def fib2(n): # return Fibonacci series up to n
     return result
 
 if __name__ == "__main__":
-    fib(int(sys.argv[1]))
+    fib(10)
+    fib(8)
