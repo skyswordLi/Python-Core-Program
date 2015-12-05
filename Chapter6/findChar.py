@@ -1,5 +1,5 @@
-def findchr( string, char ):
-    length = len( string )
+def find_chr(string, char):
+    length = len(string)
     i = 0
     while i < length:
         if string[i] == char:
@@ -7,8 +7,9 @@ def findchr( string, char ):
         i += 1
     return -1
 
-def rfindchr( string, char ):
-    length = len( string )
+
+def right_find_chr(string, char):
+    length = len(string)
     i = -1
     while i >= -length:
         if string[i] == char:
@@ -16,12 +17,12 @@ def rfindchr( string, char ):
         i -= 1
     return -1
 
-def subchr( string, origchar, newchar ):
-    length = len( string )
+
+def sub_chr(string, original_char, new_char):
+    length = len(string)
     i = 0
     while i < length:
-        if string[i] == origchar:
-            string = string[0:i] + newchar + string[i + 1:]
+        if string[i] == original_char:
+            string = string[0:i] + new_char + string[i + 1:]
         i += 1
     return string
-    

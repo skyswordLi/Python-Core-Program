@@ -1,55 +1,56 @@
-def findchar( myStr, myChar ):
+def find_char(my_str, my_char):
     '''This function return the first time( index ) a char appears in the given string.
     If the given char letter cannot be found in the string, return -1 else return
     the first index.'''
 
-    strLen = len( myStr )
-    for i in range( strLen ):
-        if myStr[ i ] == myChar:
+    str_len = len(my_str)
+    for i in range(str_len):
+        if my_str[i] == my_char:
             return i
     return -1
 
-def rfindchar( myStr, myChar ):
+
+def right_find_char(my_str, my_char):
     '''This function return the last time( right index ) a char appears in the given string.
     If the given char letter cannot be found in the string, return -1 else return
     the first index.'''
 
-    strLen = len( myStr )
-    for i in range( strLen ):
-        if myStr[ -1 - i ] == myChar:
-            return strLen - i
+    str_len = len(my_str)
+    for i in range(str_len):
+        if my_str[-1 - i] == my_char:
+            return str_len - i
     return -1
 
-def subchr( myStr, myChar, myNewChar ):
-    '''This function replace all myChar to myNewChar and return the new string.'''
 
-    outStr = ''
-    strLen = len( myStr )
-    for i in range( strLen ):
-        if myStr[ i ] == myChar:
-            outStr += myNewChar
+def sub_chr(my_str, my_char, my_new_char):
+    '''This function replace all my_char to myNewChar and return the new string.'''
+
+    out_str = ''
+    str_len = len(my_str)
+    for i in range(str_len):
+        if my_str[i] == my_char:
+            out_str += my_new_char
         else:
-            outStr += myStr[ i ]
-    return outStr
+            out_str += my_str[i]
+    return out_str
 
 if __name__ == "__main__":
-    print( "Please input a string and a char to find:" )
-    inputStr     = raw_input( 'inputStr  = ' )
-    inputChar    = raw_input( 'inputChar = ' )
-    inputNewChar = raw_input( 'inputNewChar = ' )
+    print "Please input a string and a char to find:"
+    inputStr = raw_input('inputStr  = ')
+    inputChar = raw_input('inputChar = ')
+    inputNewChar = raw_input('inputNewChar = ')
 
-    fIndex    = findchar(  inputStr, inputChar )
+    fIndex = find_char(inputStr, inputChar)
     if fIndex != -1:
-        print( 'The first index of the given char of the given string is %d ' % ( fIndex ) )
+        print 'The first index of the given char of the given string is %d ' % fIndex
     else:
-        print( 'Cannot find the given char in the given string.' )
+        print 'Cannot find the given char in the given string.'
 
-    lIndex    = rfindchar( inputStr, inputChar )
+    lIndex = right_find_char(inputStr, inputChar)
     if lIndex != -1:
-        print( 'The last index of the given char of the given string is %d ' % ( lIndex ) )
+        print 'The last index of the given char of the given string is %d ' % lIndex
     else:
-        print( 'Cannot find the given char in the given string.' )
+        print 'Cannot find the given char in the given string.'
 
-    outStr = subchr( inputStr, inputChar, inputNewChar )
-    print( 'The new string is %s' % ( outStr ) )
-
+    outStr = sub_chr(inputStr, inputChar, inputNewChar)
+    print 'The new string is %s' % outStr

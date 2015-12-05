@@ -1,16 +1,17 @@
-def showStr():
-    istr = raw_input( 'Input string:' )
-    lens = len( istr )
+def show_str():
+    input_str = raw_input('Input string:')
+    lens = len(input_str)
     if lens == 0:
         return False
     if lens == 1:
-        print( istr )
+        print input_str
         return True
-    for i, j in enumerate( istr ):
-        if i == 0 and len( istr ) != 1:
-            print( j, istr[i + 1] )
-        elif i == len( istr ) - 1 and i != 0:
-            print( istr[i - 1] )
+    for i, j in enumerate(input_str):
+        if i == 0 and len(input_str) != 1:
+            print j, input_str[i + 1]
+        elif i == len(input_str) - 1 and i != 0:
+            print input_str[i - 1]
         else:
-            print( istr[i - 1], j, istr[i + 1] )
+            print input_str[i - 1], j, input_str[i + 1]
     return True
+
